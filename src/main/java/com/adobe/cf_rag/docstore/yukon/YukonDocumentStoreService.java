@@ -160,16 +160,8 @@ public class YukonDocumentStoreService implements DocumentStoreService {
     // ========== Collection Operations ==========
 
     private Collection doCreateCollection(String token, String name, String description) throws IOException {
-        URL url = new URL(config.getYukonBaseUrl() + "/api/v2/collection");
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setConnectTimeout(15000);
-        conn.setReadTimeout(60000);
-        conn.setDoOutput(true);
-        conn.setDoInput(true);
-        conn.setRequestMethod("POST");
-        conn.setRequestProperty("Authorization", "Bearer " + token);
-        conn.setRequestProperty("Accept", "application/json");
-        conn.setRequestProperty("Content-Type", "application/json");
+        HttpURLConnection conn = createConnection("/api/v2/collection", token, "POST",
+                "application/json", 60000);
 
         ObjectNode payload = objectMapper.createObjectNode();
         payload.put("name", name);
@@ -182,14 +174,12 @@ public class YukonDocumentStoreService implements DocumentStoreService {
             objectMapper.writeValue(out, payload);
         }
 
-        int status = conn.getResponseCode();
-        InputStream is = status >= 200 && status < 300 ? conn.getInputStream() : conn.getErrorStream();
-        String body = readAll(is);
-        conn.disconnect();
-
-        if (status < 200 || status >= 300) {
-            LOG.error("Failed to create collection '{}', HTTP {}: {}", name, status, body);
-            throw new IOException("Failed to create collection: HTTP " + status + " - " + body);
+        String body;
+        try {
+            body = readResponse(conn);
+        } catch (IOException e) {
+            LOG.error("Failed to create collection '{}': {}", name, e.getMessage());
+            throw new IOException("Failed to create collection: " + e.getMessage(), e);
         }
 
         LOG.info("Created Yukon collection '{}' successfully", name);
@@ -203,18 +193,30 @@ public class YukonDocumentStoreService implements DocumentStoreService {
     private UploadResult doUploadDocument(String token, String collectionId, String fileName,
                                           String jsonContent) throws IOException {
         String boundary = "----DocStoreBoundary" + UUID.randomUUID();
-        URL url = new URL(config.getYukonBaseUrl() + "/api/v2/collection/" + collectionId + "/upload");
-
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setConnectTimeout(15000);
-        conn.setReadTimeout(60000);
-        conn.setDoOutput(true);
-        conn.setDoInput(true);
-        conn.setRequestMethod("POST");
-        conn.setRequestProperty("Authorization", "Bearer " + token);
-        conn.setRequestProperty("Accept", "application/json");
+        HttpURLConnection conn = createConnection("/api/v2/collection/" + collectionId + "/upload",
+                token, "POST", "application/json", 60000);
         conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
 
+        writeMultipartBody(conn, boundary, fileName, jsonContent);
+
+        int status = conn.getResponseCode();
+        InputStream is = status >= 200 && status < 300 ? conn.getInputStream() : conn.getErrorStream();
+        String body = readAll(is);
+        conn.disconnect();
+
+        if (status >= 200 && status < 300) {
+            LOG.debug("Uploaded {} to collection {} successfully", fileName, collectionId);
+            JsonNode json = objectMapper.readTree(body);
+            String documentId = json.has("document_id") ? json.get("document_id").asText() : fileName;
+            return UploadResult.success(documentId, fileName);
+        } else {
+            LOG.error("Upload failed for {} (collection {}), HTTP {}: {}", fileName, collectionId, status, body);
+            return UploadResult.failure(fileName, "HTTP " + status + ": " + body);
+        }
+    }
+
+    private void writeMultipartBody(HttpURLConnection conn, String boundary, String fileName,
+                                    String jsonContent) throws IOException {
         String lineEnd = "\r\n";
         String twoHyphens = "--";
 
@@ -234,115 +236,64 @@ public class YukonDocumentStoreService implements DocumentStoreService {
             out.write(end.getBytes(StandardCharsets.UTF_8));
             out.flush();
         }
-
-        int status = conn.getResponseCode();
-        InputStream is = status >= 200 && status < 300 ? conn.getInputStream() : conn.getErrorStream();
-        String body = readAll(is);
-        conn.disconnect();
-
-        if (status >= 200 && status < 300) {
-            LOG.debug("Uploaded {} to collection {} successfully", fileName, collectionId);
-            JsonNode json = objectMapper.readTree(body);
-            String documentId = json.has("document_id") ? json.get("document_id").asText() : fileName;
-            return UploadResult.success(documentId, fileName);
-        } else {
-            LOG.error("Upload failed for {} (collection {}), HTTP {}: {}", fileName, collectionId, status, body);
-            return UploadResult.failure(fileName, "HTTP " + status + ": " + body);
-        }
     }
 
     // ========== Inference ==========
 
     private InferenceResult doAskQuestion(String token, String collectionId, String question,
                                           List<String> documentIds) throws IOException {
-        URL url = new URL(config.getYukonBaseUrl() + "/api/v1/inference/question-answer/stream");
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setConnectTimeout(15000);
-        conn.setReadTimeout(120000);
-        conn.setDoOutput(true);
-        conn.setDoInput(true);
-        conn.setRequestMethod("POST");
-        conn.setRequestProperty("Authorization", "Bearer " + token);
-        conn.setRequestProperty("Accept", "text/event-stream");
-        conn.setRequestProperty("Content-Type", "application/json");
-
-        ObjectNode payload = objectMapper.createObjectNode();
-        payload.put("request_id", UUID.randomUUID().toString());
-        ArrayNode collectionsArray = payload.putArray("collections");
-        collectionsArray.add(collectionId);
-        payload.put("inputs", question);
-
-        ObjectNode responseFormat = payload.putObject("response_format");
-        responseFormat.put("format", "AUTO");
-        responseFormat.put("style", "AUTO");
-        responseFormat.put("tone", "AUTO");
-
-        payload.putArray("document_tags");
-        ArrayNode sourceOptions = payload.putArray("source_options");
-        sourceOptions.add("COLLECTION");
-        payload.put("inference_mode", "STANDARD");
-        payload.put("inference_start_time", java.time.Instant.now().toString());
-
-        if (documentIds != null && !documentIds.isEmpty()) {
-            ArrayNode docIdsArray = payload.putArray("document_ids");
-            for (String docId : documentIds) {
-                docIdsArray.add(docId.trim());
-            }
-        }
+        HttpURLConnection conn = createInferenceConnection(token);
+        ObjectNode payload = createInferencePayload(collectionId, question, documentIds);
 
         try (OutputStream out = conn.getOutputStream()) {
             objectMapper.writeValue(out, payload);
         }
 
-        int status = conn.getResponseCode();
-        if (status < 200 || status >= 300) {
-            InputStream errorStream = conn.getErrorStream();
-            String errorBody = readAll(errorStream);
-            conn.disconnect();
-            LOG.error("Yukon inference failed, HTTP {}: {}", status, errorBody);
-            return InferenceResult.failure(question, collectionId, "HTTP " + status + ": " + errorBody);
-        }
-
         StringBuilder fullAnswer = new StringBuilder();
-        try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
-            String line;
-            boolean streamComplete = false;
-            while ((line = reader.readLine()) != null && !streamComplete) {
-                if (line.startsWith("data: ")) {
-                    String jsonData = line.substring(6);
-                    JsonNode eventJson = objectMapper.readTree(jsonData);
-
-                    // Handle both array and object responses
-                    if (eventJson.isArray()) {
-                        for (JsonNode item : eventJson) {
-                            if (item.has("generated_text")) {
-                                String generatedText = item.get("generated_text").asText();
-                                generatedText = generatedText.replaceAll("\\[\\^?\\d+]", "");
-                                fullAnswer.append(generatedText);
-                            }
-                            if (item.has("stream_complete") && item.get("stream_complete").asBoolean()) {
-                                streamComplete = true;
-                                break;
-                            }
-                        }
-                    } else {
-                        if (eventJson.has("generated_text")) {
-                            String generatedText = eventJson.get("generated_text").asText();
-                            generatedText = generatedText.replaceAll("\\[\\^?\\d+]", "");
-                            fullAnswer.append(generatedText);
-                        }
-                        if (eventJson.has("stream_complete") && eventJson.get("stream_complete").asBoolean()) {
-                            streamComplete = true;
+        try {
+            processSseStream(conn, eventJson -> {
+                // Handle both array and object responses
+                if (eventJson.isArray()) {
+                    for (JsonNode item : eventJson) {
+                        appendGeneratedText(item, fullAnswer);
+                        if (isStreamComplete(item)) {
+                            return true;
                         }
                     }
+                } else {
+                    appendGeneratedText(eventJson, fullAnswer);
+                    if (isStreamComplete(eventJson)) {
+                        return true;
+                    }
                 }
-            }
+                return false;
+            });
+        } catch (IOException e) {
+            LOG.error("Yukon inference failed: {}", e.getMessage());
+            return InferenceResult.failure(question, collectionId, e.getMessage());
         }
-        conn.disconnect();
 
         LOG.info("Inference completed for question: {}", question);
         return InferenceResult.success(question, collectionId, fullAnswer.toString());
+    }
+
+    private HttpURLConnection createInferenceConnection(String token) throws IOException {
+        HttpURLConnection conn = createConnection("/api/v2/inference/question-answer/stream",
+                token, "POST", "text/event-stream", 120000);
+        conn.setDoOutput(true);
+        return conn;
+    }
+
+    private void appendGeneratedText(JsonNode node, StringBuilder builder) {
+        if (node.has("generated_text")) {
+            String generatedText = node.get("generated_text").asText();
+            generatedText = generatedText.replaceAll("\\[\\^?\\d+]", "");
+            builder.append(generatedText);
+        }
+    }
+
+    private boolean isStreamComplete(JsonNode node) {
+        return node.has("stream_complete") && node.get("stream_complete").asBoolean();
     }
 
     // ========== Document Search ==========
@@ -350,130 +301,84 @@ public class YukonDocumentStoreService implements DocumentStoreService {
     private SearchResult doSearchDocuments(String token, String collectionId, String query, int maxResults)
             throws IOException {
         // Use the same inference endpoint as askQuestion, but extract source documents
-        URL url = new URL(config.getYukonBaseUrl() + "/api/v1/inference/question-answer/stream");
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setConnectTimeout(15000);
-        conn.setReadTimeout(120000);
-        conn.setDoOutput(true);
-        conn.setDoInput(true);
-        conn.setRequestMethod("POST");
-        conn.setRequestProperty("Authorization", "Bearer " + token);
-        conn.setRequestProperty("Accept", "text/event-stream");
-        conn.setRequestProperty("Content-Type", "application/json");
-
-        ObjectNode payload = objectMapper.createObjectNode();
-        payload.put("request_id", UUID.randomUUID().toString());
-        ArrayNode collectionsArray = payload.putArray("collections");
-        collectionsArray.add(collectionId);
-        payload.put("inputs", query);
-
-        ObjectNode responseFormat = payload.putObject("response_format");
-        responseFormat.put("format", "AUTO");
-        responseFormat.put("style", "AUTO");
-        responseFormat.put("tone", "AUTO");
-
-        payload.putArray("document_tags");
-        ArrayNode sourceOptions = payload.putArray("source_options");
-        sourceOptions.add("COLLECTION");
-        payload.put("inference_mode", "STANDARD");
-        payload.put("inference_start_time", java.time.Instant.now().toString());
+        HttpURLConnection conn = createInferenceConnection(token);
+        ObjectNode payload = createInferencePayload(collectionId, query, null);
 
         try (OutputStream out = conn.getOutputStream()) {
             objectMapper.writeValue(out, payload);
         }
 
-        int status = conn.getResponseCode();
-        if (status < 200 || status >= 300) {
-            InputStream errorStream = conn.getErrorStream();
-            String errorBody = readAll(errorStream);
-            conn.disconnect();
-            LOG.error("Yukon search failed, HTTP {}: {}", status, errorBody);
-            return SearchResult.failure(query, collectionId, "HTTP " + status + ": " + errorBody);
-        }
-
-        // Collect source documents from the streaming response
         List<SearchResult.DocumentInfo> documents = new ArrayList<>();
-        try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
-            String line;
-            boolean streamComplete = false;
-            while ((line = reader.readLine()) != null && !streamComplete) {
-                if (line.startsWith("data: ")) {
-                    String jsonData = line.substring(6);
-                    JsonNode eventJson = objectMapper.readTree(jsonData);
+        try {
+            processSseStream(conn, eventJson -> {
+                // Handle both array and object responses
+                JsonNode responseNode = eventJson.isArray() && eventJson.size() > 0
+                        ? eventJson.get(0) : eventJson;
 
-                    // Handle both array and object responses
-                    JsonNode responseNode = eventJson.isArray() && eventJson.size() > 0
-                            ? eventJson.get(0) : eventJson;
+                // Extract source documents
+                extractSourceDocuments(responseNode, documents, maxResults);
 
-                    // Extract source documents
-                    JsonNode sourceNode = responseNode.get("source");
-                    if (sourceNode != null && sourceNode.isObject()) {
-                        sourceNode.fields().forEachRemaining(entry -> {
-                            JsonNode docInfo = entry.getValue();
-                            String docId = docInfo.has("document_id")
-                                    ? docInfo.get("document_id").asText() : null;
-                            String docName = docInfo.has("document_name")
-                                    ? docInfo.get("document_name").asText() : null;
-                            String jcrPath = extractJcrPathFromFileName(docName);
-                            if (docId != null && documents.size() < maxResults) {
-                                // Avoid duplicates
-                                boolean exists = documents.stream()
-                                        .anyMatch(d -> d.getDocumentId().equals(docId));
-                                if (!exists) {
-                                    documents.add(new SearchResult.DocumentInfo(docId, jcrPath));
-                                }
-                            }
-                        });
-                    }
-
-                    // Check for stream completion
-                    if (responseNode.has("stream_complete")
-                            && responseNode.get("stream_complete").asBoolean()) {
-                        streamComplete = true;
-                    }
-                }
-            }
+                return isStreamComplete(responseNode);
+            });
+        } catch (IOException e) {
+            LOG.error("Yukon search failed: {}", e.getMessage());
+            return SearchResult.failure(query, collectionId, e.getMessage());
         }
-        conn.disconnect();
 
         LOG.info("Search completed for query '{}', found {} documents", query, documents.size());
         return SearchResult.success(query, collectionId, documents);
     }
 
+    private void extractSourceDocuments(JsonNode responseNode, List<SearchResult.DocumentInfo> documents,
+                                        int maxResults) {
+        JsonNode sourceNode = responseNode.get("source");
+        if (sourceNode != null && sourceNode.isObject()) {
+            sourceNode.fields().forEachRemaining(entry -> {
+                JsonNode docInfo = entry.getValue();
+                String docId = docInfo.has("document_id")
+                        ? docInfo.get("document_id").asText() : null;
+                String docName = docInfo.has("document_name")
+                        ? docInfo.get("document_name").asText() : null;
+                String jcrPath = extractJcrPathFromFileName(docName);
+                if (docId != null && documents.size() < maxResults) {
+                    // Avoid duplicates
+                    boolean exists = documents.stream()
+                            .anyMatch(d -> d.getDocumentId().equals(docId));
+                    if (!exists) {
+                        documents.add(new SearchResult.DocumentInfo(docId, jcrPath));
+                    }
+                }
+            });
+        }
+    }
+
     // ========== List Documents ==========
+
+    private static final int PAGE_SIZE = 100; // Maximum allowed by Yukon API
 
     private ListDocumentsResult doListDocuments(String token, String collectionId) throws IOException {
         List<ListDocumentsResult.DocumentInfo> documents = new ArrayList<>();
         int page = 1;
-        int pageSize = 100; // Maximum allowed by Yukon API
         int totalPages;
 
         do {
-            URL url = new URL(config.getYukonBaseUrl() + "/api/v1/collection/" + collectionId
-                    + "/page?page=" + page + "&page_size=" + pageSize);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(15000);
-            conn.setReadTimeout(60000);
-            conn.setRequestMethod("GET");
-            conn.setRequestProperty("Authorization", "Bearer " + token);
-            conn.setRequestProperty("Accept", "application/json");
+            String urlPath = "/api/v2/collection/" + collectionId
+                    + "/document?page=" + page + "&page_size=" + PAGE_SIZE;
+            HttpURLConnection conn = createConnection(urlPath, token, "GET", "application/json", 60000);
 
-            int status = conn.getResponseCode();
-            InputStream is = status >= 200 && status < 300 ? conn.getInputStream() : conn.getErrorStream();
-            String body = readAll(is);
-            conn.disconnect();
-
-            if (status < 200 || status >= 300) {
-                LOG.error("Yukon list documents failed, HTTP {}: {}", status, body);
-                return ListDocumentsResult.failure(collectionId, "HTTP " + status + ": " + body);
+            String body;
+            try {
+                body = readResponse(conn);
+            } catch (IOException e) {
+                LOG.error("Yukon list documents failed: {}", e.getMessage());
+                return ListDocumentsResult.failure(collectionId, e.getMessage());
             }
 
             JsonNode json = objectMapper.readTree(body);
 
             // Calculate total pages from response
             int total = json.has("total") ? json.get("total").asInt() : 0;
-            totalPages = (total + pageSize - 1) / pageSize;
+            totalPages = (total + PAGE_SIZE - 1) / PAGE_SIZE;
 
             // Response is an InfoPage object with a "pages" array containing DocumentInfo objects
             JsonNode pagesArray = json.get("pages");
@@ -496,6 +401,114 @@ public class YukonDocumentStoreService implements DocumentStoreService {
     }
 
     // ========== Utility Methods ==========
+
+    /**
+     * Creates an HTTP connection with common settings for Yukon API calls.
+     */
+    private HttpURLConnection createConnection(String urlPath, String token, String method,
+                                               String accept, int readTimeout) throws IOException {
+        URL url = new URL(config.getYukonBaseUrl() + urlPath);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setConnectTimeout(15000);
+        conn.setReadTimeout(readTimeout);
+        conn.setDoInput(true);
+        conn.setRequestMethod(method);
+        conn.setRequestProperty("Authorization", "Bearer " + token);
+        conn.setRequestProperty("Accept", accept);
+        if ("POST".equals(method)) {
+            conn.setDoOutput(true);
+            conn.setRequestProperty("Content-Type", "application/json");
+        }
+        return conn;
+    }
+
+    /**
+     * Creates the common inference request payload.
+     */
+    private ObjectNode createInferencePayload(String collectionId, String inputText,
+                                              List<String> documentIds) {
+        ObjectNode payload = objectMapper.createObjectNode();
+        payload.put("request_id", UUID.randomUUID().toString());
+        ArrayNode collectionsArray = payload.putArray("collections");
+        collectionsArray.add(collectionId);
+        payload.put("inputs", inputText);
+
+        ObjectNode responseFormat = payload.putObject("response_format");
+        responseFormat.put("format", "AUTO");
+        responseFormat.put("style", "AUTO");
+        responseFormat.put("tone", "AUTO");
+
+        payload.putArray("document_tags");
+        ArrayNode sourceOptions = payload.putArray("source_options");
+        sourceOptions.add("COLLECTION");
+        payload.put("inference_mode", "STANDARD");
+        payload.put("inference_start_time", java.time.Instant.now().toString());
+
+        if (documentIds != null && !documentIds.isEmpty()) {
+            ArrayNode docIdsArray = payload.putArray("document_ids");
+            for (String docId : documentIds) {
+                docIdsArray.add(docId.trim());
+            }
+        }
+
+        return payload;
+    }
+
+    /**
+     * Reads the response body and handles error checking.
+     * Returns the response body string, or throws IOException on error.
+     */
+    private String readResponse(HttpURLConnection conn) throws IOException {
+        int status = conn.getResponseCode();
+        InputStream is = status >= 200 && status < 300 ? conn.getInputStream() : conn.getErrorStream();
+        String body = readAll(is);
+        conn.disconnect();
+
+        if (status < 200 || status >= 300) {
+            throw new IOException("HTTP " + status + ": " + body);
+        }
+        return body;
+    }
+
+    /**
+     * Functional interface for processing SSE events.
+     */
+    @FunctionalInterface
+    private interface SseEventProcessor {
+        /**
+         * Process an SSE event.
+         * @param eventJson the parsed JSON from the event
+         * @return true if stream processing should stop
+         */
+        boolean process(JsonNode eventJson);
+    }
+
+    /**
+     * Reads and processes an SSE stream from the connection.
+     */
+    private void processSseStream(HttpURLConnection conn, SseEventProcessor processor) throws IOException {
+        int status = conn.getResponseCode();
+        if (status < 200 || status >= 300) {
+            InputStream errorStream = conn.getErrorStream();
+            String errorBody = readAll(errorStream);
+            conn.disconnect();
+            throw new IOException("HTTP " + status + ": " + errorBody);
+        }
+
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            boolean streamComplete = false;
+            while ((line = reader.readLine()) != null && !streamComplete) {
+                if (line.startsWith("data: ")) {
+                    String jsonData = line.substring(6);
+                    JsonNode eventJson = objectMapper.readTree(jsonData);
+                    streamComplete = processor.process(eventJson);
+                }
+            }
+        }
+        conn.disconnect();
+    }
 
     /**
      * Extracts the JCR path from a document filename.
